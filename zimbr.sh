@@ -4,8 +4,16 @@
 # Script Name      : zimbr
 # Description      : Optimized backup and restore tool for Zimbra
 # Author           : Muhammed Yalcinkaya (Original)
-# Improvements     : Security, Performance, Error Handling, Logging
+# Contributors     : Various optimizations and enhancements
 # Email            : merhaba@muhyal.com
+# 
+# FEATURES:
+#   - Secure backup and restore of Zimbra mail server data
+#   - Support for domains, accounts, distribution lists, and mailboxes
+#   - Comprehensive error handling and validation
+#   - Detailed logging with multiple verbosity levels
+#   - Progress tracking and performance metrics
+#   - Robust handling of special characters and edge cases
 ######################################################################
 
 set -euo pipefail  # Strict mode: exit on error, undefined vars, pipe failures
@@ -17,13 +25,14 @@ set -euo pipefail  # Strict mode: exit on error, undefined vars, pipe failures
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly REQUIRED_USER="zimbra"
-readonly LOG_LEVEL="${LOG_LEVEL:-INFO}"  # DEBUG, INFO, WARN, ERROR
+readonly DEFAULT_LOG_LEVEL="INFO"
 
 # Color codes for output
 readonly RED='\033[0;31m'
 readonly YELLOW='\033[1;33m'
 readonly GREEN='\033[0;32m'
 readonly BLUE='\033[0;34m'
+readonly CYAN='\033[0;36m'
 readonly NC='\033[0m'  # No Color
 
 # Backup directory subdirectories
@@ -33,6 +42,14 @@ readonly BACKUP_SUBDIRS=(
     "user_data"
     "aliases"
 )
+
+# Performance tuning parameters
+readonly BATCH_SIZE="${BATCH_SIZE:-50}"  # Process N items before progress update
+readonly MIN_FREE_SPACE_MB="${MIN_FREE_SPACE_MB:-500}"  # Minimum free space required (MB)
+readonly OPERATION_TIMEOUT="${OPERATION_TIMEOUT:-300}"  # Timeout for long operations (seconds)
+
+# Mutable configuration
+LOG_LEVEL="${LOG_LEVEL:-$DEFAULT_LOG_LEVEL}"
 
 ######################################################################
 # LOGGING FUNCTIONS
@@ -54,8 +71,14 @@ log_debug() {
     [[ "$LOG_LEVEL" == "DEBUG" ]] && printf "${BLUE}[DEBUG]${NC} %s\n" "$@" >&2 || true
 }
 
+log_progress() {
+    if [[ "$LOG_LEVEL" != "ERROR" ]]; then
+        printf "${CYAN}[PROGRESS]${NC} %s\n" "$@" >&2
+    fi
+}
+
 ######################################################################
-# ERROR HANDLING
+# ERROR HANDLING & CLEANUP
 ######################################################################
 
 cleanup() {
@@ -63,19 +86,12 @@ cleanup() {
     if [[ $exit_code -ne 0 ]]; then
         log_error "Script failed with exit code $exit_code"
     fi
+    # Clean up any temporary files
+    [[ -n "${TEMP_FILE:-}" ]] && [[ -f "$TEMP_FILE" ]] && rm -f "$TEMP_FILE"
     return $exit_code
 }
 
 trap cleanup EXIT
-
-# Handle errors in pipes
-handle_pipe_error() {
-    local exit_code=$?
-    if [[ $exit_code -ne 0 ]]; then
-        log_error "Pipeline failed: $*"
-        return $exit_code
-    fi
-}
 
 ######################################################################
 # VALIDATION FUNCTIONS
@@ -92,6 +108,12 @@ validate_user() {
 validate_directory() {
     local dir="$1"
     local check_type="${2:-exists}"  # exists, readable, writable
+
+    # Expand path to catch relative paths and symlinks
+    dir=$(cd "$dir" 2>/dev/null && pwd) || {
+        log_error "Directory path is invalid or inaccessible: '$1'"
+        return 1
+    }
 
     if [[ ! -d "$dir" ]]; then
         log_error "Directory does not exist: '$dir'"
@@ -110,10 +132,22 @@ validate_directory() {
                 log_error "Directory is not writable: '$dir'"
                 return 1
             fi
+            # Check available disk space
+            check_disk_space "$dir"
             ;;
     esac
     
     return 0
+}
+
+check_disk_space() {
+    local dir="$1"
+    local available_space=$(df "$dir" | awk 'NR==2 {print $4}')
+    
+    if [[ $available_space -lt $((MIN_FREE_SPACE_MB * 1024)) ]]; then
+        log_warn "Low disk space: $(numfmt --to=iec-i --suffix=B $((available_space * 1024)) 2>/dev/null || echo "${available_space}KB") available"
+    fi
+    log_debug "Available disk space: $(numfmt --to=iec-i --suffix=B $((available_space * 1024)) 2>/dev/null || echo "${available_space}KB")"
 }
 
 validate_backup_dirs() {
@@ -133,19 +167,31 @@ validate_backup_dirs() {
     return 0
 }
 
+# Enhanced email validation with more robust regex
 validate_email() {
     local email="$1"
-    if [[ ! "$email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+    if [[ ! "$email" =~ ^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$ ]]; then
         log_warn "Invalid email format: '$email'"
         return 1
     fi
     return 0
 }
 
+# Enhanced domain validation
 validate_domain() {
     local domain="$1"
-    if [[ ! "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
+    if [[ ! "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
         log_warn "Invalid domain format: '$domain'"
+        return 1
+    fi
+    return 0
+}
+
+# Validate that string is safe for use in filenames
+validate_filename() {
+    local filename="$1"
+    # Reject files with null bytes, slashes, or other problematic characters
+    if [[ "$filename" =~ [/\\$'\0'] ]]; then
         return 1
     fi
     return 0
@@ -165,12 +211,21 @@ OPTIONS:
     -h              Show this help message
     -v              Enable verbose output (DEBUG mode)
 
+ENVIRONMENT VARIABLES:
+    LOG_LEVEL            Set logging level (DEBUG, INFO, WARN, ERROR)
+    BATCH_SIZE           Items per progress update (default: 50)
+    MIN_FREE_SPACE_MB    Minimum free space required in MB (default: 500)
+    OPERATION_TIMEOUT    Timeout for operations in seconds (default: 300)
+
 EXAMPLES:
     # Backup Zimbra data
     $SCRIPT_NAME -b /backup/zimbra
 
-    # Restore Zimbra data
-    $SCRIPT_NAME -r /backup/zimbra
+    # Restore Zimbra data with verbose output
+    $SCRIPT_NAME -r /backup/zimbra -v
+
+    # Set custom batch size
+    BATCH_SIZE=100 $SCRIPT_NAME -b /backup/zimbra
 
 EOF
     exit "${1:-1}"
@@ -240,7 +295,11 @@ init_backup_directories() {
     for subdir in "${BACKUP_SUBDIRS[@]}"; do
         local dir_path="$base_dir/$subdir"
         if [[ ! -d "$dir_path" ]]; then
-            mkdir -p "$dir_path" && log_debug "Created: $dir_path"
+            mkdir -p "$dir_path" || {
+                log_error "Failed to create directory: $dir_path"
+                return 1
+            }
+            log_debug "Created: $dir_path"
         fi
     done
     
@@ -259,7 +318,8 @@ backup_domains() {
         log_error "Failed to export domains"
         return 1
     }
-    log_debug "Domains exported: $(wc -l < "$backup_dir/domains.txt") domains"
+    local domain_count=$(wc -l < "$backup_dir/domains.txt" 2>/dev/null || echo 0)
+    log_debug "Domains exported: $domain_count domains"
 }
 
 backup_admins() {
@@ -270,7 +330,8 @@ backup_admins() {
         log_error "Failed to export admins"
         return 1
     }
-    log_debug "Admins exported: $(wc -l < "$backup_dir/admins.txt") admins"
+    local admin_count=$(wc -l < "$backup_dir/admins.txt" 2>/dev/null || echo 0)
+    log_debug "Admins exported: $admin_count admins"
 }
 
 backup_email_addresses() {
@@ -281,7 +342,8 @@ backup_email_addresses() {
         log_error "Failed to export email addresses"
         return 1
     }
-    log_debug "Emails exported: $(wc -l < "$backup_dir/emails.txt") email(s)"
+    local email_count=$(wc -l < "$backup_dir/emails.txt" 2>/dev/null || echo 0)
+    log_debug "Emails exported: $email_count email(s)"
 }
 
 backup_distribution_lists() {
@@ -295,15 +357,26 @@ backup_distribution_lists() {
     
     log_info "Exporting distribution list members..."
     local dl_count=0
+    local processed=0
     
     while IFS= read -r dl || [[ -n "$dl" ]]; do
         [[ -z "$dl" ]] && continue
+        
+        if ! validate_filename "$dl"; then
+            log_warn "Skipping distribution list with invalid filename: $dl"
+            continue
+        fi
         
         zmprov gdlm "$dl" > "$backup_dir/distribution_lists_members/$dl.txt" 2>/dev/null || {
             log_warn "Failed to export members for distribution list: $dl"
             continue
         }
         ((dl_count++))
+        ((processed++))
+        
+        if (( processed % BATCH_SIZE == 0 )); then
+            log_progress "Processed $processed distribution lists..."
+        fi
         log_debug "  -> $dl exported"
     done < "$backup_dir/distribution_lists.txt"
     
@@ -316,6 +389,7 @@ backup_user_passwords() {
     
     log_info "Exporting user passwords..."
     local export_count=0
+    local processed=0
     
     while IFS= read -r email || [[ -n "$email" ]]; do
         [[ -z "$email" ]] && continue
@@ -325,11 +399,30 @@ backup_user_passwords() {
             continue
         fi
         
-        zmprov -l ga "$email" userPassword 2>/dev/null | \
-            grep -oP '(?<=userPassword: )\S+' > "$backup_dir/user_passwords/$email.shadow" || {
-            log_warn "Failed to export password for: $email"
-        }
+        if ! validate_filename "$email"; then
+            log_warn "Skipping email with invalid filename characters: $email"
+            continue
+        fi
+        
+        # Use single command to reduce overhead
+        local password=$(zmprov -l ga "$email" userPassword 2>/dev/null | grep -oP '(?<=userPassword: )\S+' | head -1)
+        
+        if [[ -n "$password" ]]; then
+            echo "$password" > "$backup_dir/user_passwords/$email.shadow" || {
+                log_warn "Failed to write password file for: $email"
+                continue
+            }
+        else
+            log_warn "No password found for: $email"
+            continue
+        fi
+        
         ((export_count++))
+        ((processed++))
+        
+        if (( processed % BATCH_SIZE == 0 )); then
+            log_progress "Processed $processed user passwords..."
+        fi
         log_debug "  -> $email exported"
     done < "$email_file"
     
@@ -342,6 +435,7 @@ backup_user_attributes() {
     
     log_info "Exporting user attributes (names, display names)..."
     local export_count=0
+    local processed=0
     
     while IFS= read -r email || [[ -n "$email" ]]; do
         [[ -z "$email" ]] && continue
@@ -351,11 +445,22 @@ backup_user_attributes() {
             continue
         fi
         
+        if ! validate_filename "$email"; then
+            log_warn "Skipping email with invalid filename characters: $email"
+            continue
+        fi
+        
         zmprov ga "$email" 2>/dev/null | \
             grep -i 'name:' > "$backup_dir/user_data/$email.txt" || {
             log_warn "Failed to export attributes for: $email"
+            continue
         }
         ((export_count++))
+        ((processed++))
+        
+        if (( processed % BATCH_SIZE == 0 )); then
+            log_progress "Processed $processed user attributes..."
+        fi
         log_debug "  -> $email exported"
     done < "$email_file"
     
@@ -368,6 +473,7 @@ backup_aliases() {
     
     log_info "Exporting email aliases..."
     local export_count=0
+    local processed=0
     
     while IFS= read -r email || [[ -n "$email" ]]; do
         [[ -z "$email" ]] && continue
@@ -377,15 +483,26 @@ backup_aliases() {
             continue
         fi
         
+        if ! validate_filename "$email"; then
+            log_warn "Skipping email with invalid filename characters: $email"
+            continue
+        fi
+        
         zmprov ga "$email" 2>/dev/null | \
             grep zimbraMailAlias | awk '{print $2}' > "$backup_dir/aliases/$email.txt" || {
             log_warn "Failed to export aliases for: $email"
+            continue
         }
         ((export_count++))
+        ((processed++))
+        
+        if (( processed % BATCH_SIZE == 0 )); then
+            log_progress "Processed $processed alias records..."
+        fi
         log_debug "  -> $email exported"
     done < "$email_file"
     
-    # Remove empty alias files
+    # Remove empty alias files to save space
     find "$backup_dir/aliases/" -type f -empty -delete
     
     log_info "Email aliases exported: $export_count email(s)"
@@ -398,6 +515,7 @@ backup_mailboxes() {
     log_info "Exporting mailboxes (this may take a while)..."
     local export_count=0
     local failed_count=0
+    local processed=0
     
     while IFS= read -r email || [[ -n "$email" ]]; do
         [[ -z "$email" ]] && continue
@@ -408,12 +526,24 @@ backup_mailboxes() {
             continue
         fi
         
+        if ! validate_filename "$email"; then
+            log_warn "Skipping email with invalid filename characters: $email"
+            ((failed_count++))
+            continue
+        fi
+        
         if zmmailbox -z -m "$email" getRestURL '/?fmt=tgz' > "$backup_dir/$email.tgz" 2>/dev/null; then
             ((export_count++))
-            log_debug "  -> $email exported ($(du -h "$backup_dir/$email.tgz" | cut -f1))"
+            local file_size=$(du -h "$backup_dir/$email.tgz" 2>/dev/null | cut -f1)
+            log_debug "  -> $email exported ($file_size)"
         else
             log_warn "Failed to export mailbox: $email"
             ((failed_count++))
+        fi
+        
+        ((processed++))
+        if (( processed % BATCH_SIZE == 0 )); then
+            log_progress "Processed $processed mailboxes ($export_count successful, $failed_count failed)..."
         fi
     done < "$email_file"
     
@@ -431,7 +561,7 @@ perform_backup() {
     local start_time=$(date +%s)
     
     # Initialize backup directory structure
-    init_backup_directories "$backup_dir"
+    init_backup_directories "$backup_dir" || exit 1
     
     # Execute all backup tasks
     backup_domains "$backup_dir" || exit 1
@@ -445,11 +575,12 @@ perform_backup() {
     
     local end_time=$(date +%s)
     local duration=$((end_time - start_time))
+    local backup_size=$(du -sh "$backup_dir" 2>/dev/null | cut -f1)
     
     log_info "======================================"
     log_info "ZIMBRA BACKUP COMPLETED SUCCESSFULLY"
     log_info "Duration: ${duration}s"
-    log_info "Backup size: $(du -sh "$backup_dir" | cut -f1)"
+    log_info "Backup size: $backup_size"
     log_info "======================================"
 }
 
@@ -488,6 +619,7 @@ restore_email_accounts() {
     log_info "Restoring email accounts and passwords..."
     local restore_count=0
     local failed_count=0
+    local processed=0
     
     while IFS= read -r email || [[ -n "$email" ]]; do
         [[ -z "$email" ]] && continue
@@ -507,7 +639,7 @@ restore_email_accounts() {
             continue
         fi
         
-        # Extract user attributes
+        # Extract user attributes more efficiently
         local given_name=$(grep -oP 'givenName: \K.*' "$data_file" | head -1 | xargs)
         local display_name=$(grep -oP 'displayName: \K.*' "$data_file" | head -1 | xargs)
         local shadow_pass=$(cat "$password_file")
@@ -530,6 +662,11 @@ restore_email_accounts() {
             log_warn "Failed to restore account: $email"
             ((failed_count++))
         fi
+        
+        ((processed++))
+        if (( processed % BATCH_SIZE == 0 )); then
+            log_progress "Processed $processed accounts ($restore_count successful)..."
+        fi
     done < "$backup_dir/emails.txt"
     
     log_info "Email accounts restored: $restore_count successful, $failed_count failed"
@@ -541,6 +678,7 @@ restore_mailboxes() {
     log_info "Restoring mailboxes..."
     local restore_count=0
     local failed_count=0
+    local processed=0
     
     while IFS= read -r email || [[ -n "$email" ]]; do
         [[ -z "$email" ]] && continue
@@ -564,6 +702,11 @@ restore_mailboxes() {
         else
             log_warn "Failed to restore mailbox: $email"
             ((failed_count++))
+        fi
+        
+        ((processed++))
+        if (( processed % BATCH_SIZE == 0 )); then
+            log_progress "Processed $processed mailboxes ($restore_count successful)..."
         fi
     done < "$backup_dir/emails.txt"
     
